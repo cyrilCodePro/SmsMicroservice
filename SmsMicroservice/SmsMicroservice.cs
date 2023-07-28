@@ -13,7 +13,7 @@ public class SmsMicroservice
     private readonly ISmsApiClient<SendSmsCommand, HttpResponseMessage> _httpClient;
     private readonly IEventBus<SmsSent> _eventBus;
     private readonly ILogger _logger;
-    private readonly IAsyncPolicy<HttpResponseMessage> _retryPolicy;
+    private readonly IAsyncPolicy<HttpResponseMessage> _policy;
     private readonly ConcurrentDictionary<Guid, byte> _processedCommands;
 
     public SmsMicroservice(
@@ -37,7 +37,9 @@ public class SmsMicroservice
          * (according to the exponential backoff strategy), then attempt to send the SMS again. If it still fails, the policy will wait and retry again,
          * up to a maximum of 3 retries.
          */
-        _retryPolicy = Policy<HttpResponseMessage>
+       
+        // Define a retry policy
+        var retryPolicy = Policy<HttpResponseMessage>
             .HandleResult(message => !message.IsSuccessStatusCode)
             .Or<Exception>()
             .WaitAndRetryAsync(3, retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
@@ -53,6 +55,39 @@ public class SmsMicroservice
                     }
                 }
             );
+   
+
+        // Circuit Breaker policy:
+        // Handles exceptions from HTTP responses.
+        // If it encounters 3 consecutive exceptions, it will "open the circuit" -- stop trying the request -- for 1 minute.
+        // During this time, any attempt to execute the action will fail immediately.
+        // It will log when the circuit is opened and when it is reset.
+
+        var circuitBreakerPolicy = Policy
+            .Handle<Exception>()
+            .CircuitBreakerAsync(
+                exceptionsAllowedBeforeBreaking: 3,
+                durationOfBreak: TimeSpan.FromMinutes(1),
+                onBreak: (ex, breakDelay) =>
+                {
+                    // This block is called when circuit breaker opens the circuit
+                    logger.LogError($"Circuit breaker opened for {breakDelay.TotalSeconds} seconds due to: {ex.Message}");
+                },
+                onReset: () =>
+                {
+                    // This block is called when circuit breaker resets (closes the circuit)
+                    logger.LogInformation("Circuit breaker reset");
+                },
+                onHalfOpen: () =>
+                {
+                    // This block is called when circuit breaker is half-open (after the durationOfBreak, before first trial)
+                    logger.LogInformation("Circuit breaker half-open");
+                }
+            );
+        // Wrap the retry policy with the circuit breaker
+        
+
+        _policy =retryPolicy.WrapAsync(circuitBreakerPolicy);
     }
 
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -69,7 +104,7 @@ public class SmsMicroservice
         // Ignore if this command has already been processed
         if (_processedCommands.TryAdd(command.IdempotencyKey, 0))
         {
-            var response = await _retryPolicy.ExecuteAsync(
+            var response = await _policy.ExecuteAsync(
                 () => _httpClient.PostAsync(command)
             );
 

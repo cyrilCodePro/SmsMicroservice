@@ -1,5 +1,7 @@
 using Moq;
 using System.Net;
+using System.Text.RegularExpressions;
+using Polly.CircuitBreaker;
 using SmsMicroservice.Contracts;
 using SmsMicroservice.Events;
 using SmsMicroservice.Logger;
@@ -106,5 +108,42 @@ public class SmsMicroserviceTests
           // Verifying that an SMS sent event was published twice and no errors were logged
           _eventBusMock.Verify(x => x.PublishAsync(It.IsAny<SmsSent>()), Times.Exactly(2));
           _loggerMock.Verify(x => x.LogError(It.IsAny<string>()), Times.Never);
+      }
+      [Fact]
+      public async Task ProcessCommandAsync_ThrowsException_ActivatesCircuitBreaker()
+      {
+          // Arrange
+          // Creating a new SMS command to send
+          var command = new SendSmsCommand { IdempotencyKey = Guid.NewGuid(), PhoneNumber = "123456789", SmsText = "Hello" };
+
+          // Mocking a continuous exception
+          _httpClientMock.Setup(x => x.PostAsync(command))
+              .ThrowsAsync(new HttpRequestException());
+
+          // Act
+          // Creating the service and processing the command
+          var service = new SmsMicroservice.SmsMicroservice(_messageQueueMock.Object, _httpClientMock.Object, _eventBusMock.Object, _loggerMock.Object);
+
+          // Multiple command processing to simulate multiple attempts
+          for (int i = 0; i < 10; i++)
+          {
+              try
+              {
+                  await service.ProcessCommandAsync(command, CancellationToken.None);
+              }
+              catch (BrokenCircuitException)
+              {
+                  i++;
+              }
+
+          }
+
+          // Assert
+          // Verifying that no SMS sent event was published, the error was logged multiple times due to the retries,
+          // and a circuit breaker activation was logged.
+          _eventBusMock.Verify(x => x.PublishAsync(It.IsAny<SmsSent>()), Times.Never);
+          _loggerMock.Verify(x => x.LogError(It.IsAny<string>()), Times.Exactly(4)); // due to retries
+          _loggerMock.Verify(x => x.LogError(It.Is<string>(s => Regex.IsMatch(s, @"Circuit breaker opened for 60 seconds due to:.*"))), Times.Once);
+          // circuit breaker activation
       }
   }
